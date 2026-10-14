@@ -12,6 +12,16 @@ services:
     depends_on: [redis, qdrant]
     restart: unless-stopped
 
+  streamlit:
+    image: rag-ingest:latest
+    command: streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+    ports: ["8501:8501"]
+    env_file: .env
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on: [api]
+    restart: unless-stopped
+
   worker:
     image: rag-ingest:latest          # same image as api, so it's built once
     command: celery -A app.worker.celery_app.celery worker --loglevel=info --concurrency=2
