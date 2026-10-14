@@ -33,8 +33,13 @@ with st.sidebar:
     st.markdown("Test RAG Ingestion, Vector Search & Opportunity Digests.")
 
     st.subheader("Configuration")
-    api_base = st.text_input("FastAPI Base URL", value="http://localhost:8000")
-    api_key = st.text_input("API Key (x-api-key)", value="change-me", type="password")
+    api_base = st.text_input(
+        "FastAPI Base URL",
+        value=os.getenv("API_BASE_URL", "http://localhost:8000"),
+    )
+    api_key = st.text_input(
+        "API Key (x-api-key)", value=os.getenv("API_KEY", "change-me"), type="password"
+    )
 
     st.divider()
     st.subheader("Services Health Check")
