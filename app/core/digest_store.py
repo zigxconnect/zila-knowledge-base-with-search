@@ -11,6 +11,14 @@ def acquire_run_lock(week: str) -> bool:
     return bool(r.set(f"digest_run_lock:{week}", "1", nx=True, ex=6 * 86400))
 
 
+def acquire_student_lock(week: str, segment_id: str) -> bool:
+    return bool(r.set(f"digest_student_lock:{week}:{segment_id}", "1", nx=True, ex=5 * 60))
+
+
+def release_student_lock(week: str, segment_id: str):
+    r.delete(f"digest_student_lock:{week}:{segment_id}")
+
+
 def init_run(week: str, total: int):
     key = f"digest_run:{week}"
     r.delete(key)

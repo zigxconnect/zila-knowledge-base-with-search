@@ -2,9 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core import delivery, digest_agent, digest_store as store
-from app.core.profiles import _slug
+from dataclasses import asdict
+
+from app.core.profiles import Profile, _slug, personalized_segment
 from app.security import require_api_key
-from app.worker.digest_tasks import run_weekly_digest
+from app.worker.digest_tasks import build_student_digest, run_weekly_digest
 
 router = APIRouter(prefix="/v1/digests", dependencies=[Depends(require_api_key)])
 
@@ -33,6 +35,14 @@ class PreviewRequest(BaseModel):
     level: str | None = None
 
 
+class StudentRecommendationRequest(BaseModel):
+    department: str = Field(min_length=1, max_length=120)
+    skills: list[str] = Field(default_factory=list, max_length=40)
+    interests: list[str] = Field(default_factory=list, max_length=30)
+    level: str | None = Field(default=None, max_length=80)
+    location: str | None = Field(default=None, max_length=120)
+
+
 @router.post("/run", status_code=202)
 def run(req: RunRequest):
     """Queue a digest run (same job the weekly cron triggers)."""
@@ -55,6 +65,40 @@ def preview(req: PreviewRequest):
         return digest_agent.build_digest(seg, seen_urls=set())
     except Exception as e:                      # noqa: BLE001
         raise HTTPException(502, f"Digest generation failed: {e}")
+
+
+@router.post("/student/{student_id}/recommendation", status_code=202)
+def student_recommendation(student_id: str, req: StudentRecommendationRequest):
+    profile = Profile(
+        id=student_id,
+        department=req.department.strip().lower(),
+        skills=req.skills,
+        interests=req.interests,
+        level=req.level,
+        location=req.location,
+    )
+    segment = personalized_segment(profile)
+    if not segment:
+        raise HTTPException(422, "A study field or department is required")
+
+    week = digest_agent.week_id()
+    cached = store.get_digest(week, segment.segment_id)
+    if cached:
+        if cached["status"] == "published":
+            store.save_segment_students(segment.segment_id, [student_id])
+            return {"status": "ready", "digest": cached}
+        if cached["status"] == "empty":
+            return {"status": "empty"}
+
+    if not store.acquire_student_lock(week, segment.segment_id):
+        return {"status": "queued", "week": week}
+
+    try:
+        task = build_student_digest.delay(asdict(segment), week, student_id)
+    except Exception as error:
+        store.release_student_lock(week, segment.segment_id)
+        raise HTTPException(503, "Could not queue recommendations") from error
+    return {"status": "queued", "week": week, "task_id": task.id}
 
 
 @router.get("/run-status")
