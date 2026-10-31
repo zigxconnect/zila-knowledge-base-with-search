@@ -1,4 +1,6 @@
 """Student profiles -> segments. Segments, not individuals, drive the web search."""
+import hashlib
+import json
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -26,6 +28,18 @@ def _as_list(v) -> list[str]:
     return [str(x).strip() for x in v if str(x).strip()]
 
 
+def _combined_lists(d: dict, *keys: str) -> list[str]:
+    values = []
+    seen = set()
+    for key in keys:
+        for value in _as_list(d.get(key)):
+            normalized = value.casefold()
+            if normalized not in seen:
+                values.append(value)
+                seen.add(normalized)
+    return values
+
+
 @dataclass
 class Profile:
     id: str
@@ -37,14 +51,22 @@ class Profile:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Profile":
-        """Tolerant mapping: adapt the key names here to the real Zigex payload."""
+        """Map Zigex student profile fields into the digest's normalized shape."""
+        nested = d.get("profile")
+        source = {**d, **nested} if isinstance(nested, dict) else d
         return cls(
-            id=str(d.get("id") or d.get("student_id")),
-            department=_norm(d.get("department") or d.get("track") or d.get("field")),
-            skills=_as_list(d.get("skills")),
-            interests=_as_list(d.get("interests")),
-            level=d.get("level"),
-            location=d.get("location") or d.get("city") or d.get("country"),
+            id=str(source.get("id") or source.get("student_id") or d.get("id") or d.get("student_id")),
+            department=_norm(
+                source.get("department")
+                or source.get("track")
+                or source.get("field")
+                or source.get("field_of_study")
+                or source.get("fieldOfStudy")
+            ),
+            skills=_combined_lists(source, "skills", "hard_skills", "hardSkills", "soft_skills", "softSkills"),
+            interests=_combined_lists(source, "interests", "preferred_industries", "preferredIndustries"),
+            level=source.get("level") or source.get("education_level") or source.get("educationLevel") or source.get("degree"),
+            location=source.get("location") or source.get("city") or source.get("country"),
         )
 
 
@@ -97,6 +119,28 @@ def segment_profiles(profiles: list[Profile]) -> list[Segment]:
         merged.setdefault(key, []).extend(members)
 
     return [_build(d, l, m) for (d, l), m in merged.items()]
+
+
+def personalized_segment(profile: Profile) -> Segment | None:
+    department = _norm(profile.department)
+    if not department:
+        return None
+
+    normalized = json.dumps(
+        {
+            "student_id": profile.id,
+            "department": department,
+            "skills": sorted(skill.casefold() for skill in profile.skills),
+            "interests": sorted(interest.casefold() for interest in profile.interests),
+            "level": _norm(profile.level),
+            "location": _norm(profile.location),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    segment = _build(department, _norm(profile.location) or None, [profile])
+    segment.segment_id = f"student__{hashlib.sha256(normalized.encode()).hexdigest()[:24]}"
+    return segment
 
 
 def fetch_profiles() -> list[Profile]:

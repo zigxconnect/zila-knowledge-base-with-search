@@ -58,3 +58,24 @@ def build_segment_digest(self, segment: dict, week: str, dry_run: bool = False):
         if not isinstance(e, RETRYABLE) or self.request.retries >= self.max_retries:
             store.bump(week, "failed")
         raise
+
+
+@celery.task(bind=True, name="digest.build_student", autoretry_for=RETRYABLE,
+             retry_backoff=60, retry_backoff_max=600, max_retries=2, rate_limit="6/m")
+def build_student_digest(self, segment: dict, week: str, student_id: str):
+    segment_id = segment["segment_id"]
+    try:
+        digest = digest_agent.build_digest(segment, week, store.get_seen(segment_id))
+        digest["status"] = "published" if digest["items"] else "empty"
+        if digest["items"]:
+            store.mark_seen(segment_id, [item["url"] for item in digest["items"]])
+        store.save_digest(digest)
+        store.save_segment_students(segment_id, [student_id])
+        return {"segment": segment_id, "status": digest["status"], "items": len(digest["items"])}
+    except Exception as error:
+        if not isinstance(error, RETRYABLE) or self.request.retries >= self.max_retries:
+            store.release_student_lock(week, segment_id)
+        raise
+    finally:
+        if not self.request.called_directly or self.request.retries >= 0:
+            store.release_student_lock(week, segment_id)

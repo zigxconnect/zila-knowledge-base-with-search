@@ -8,7 +8,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       UPLOAD_DIR: /data/uploads
-    volumes: [uploads:/data/uploads]
+    volumes:
+      - uploads:/data/uploads
+      - ./app:/srv/app:ro
     depends_on: [redis, qdrant]
     restart: unless-stopped
 
@@ -24,10 +26,12 @@ services:
 
   worker:
     image: rag-ingest:latest          # same image as api, so it's built once
-    command: celery -A app.worker.celery_app.celery worker --loglevel=info --concurrency=2
+    command: celery -A app.worker.digest_tasks:celery worker --loglevel=info --concurrency=2
     env_file: .env
     environment: *env
-    volumes: [uploads:/data/uploads]
+    volumes:
+      - uploads:/data/uploads
+      - ./app:/srv/app:ro
     depends_on: [api, redis, qdrant]
     restart: unless-stopped
 
