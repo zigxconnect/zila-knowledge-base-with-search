@@ -71,6 +71,10 @@ def build_student_digest(self, segment: dict, week: str, student_id: str):
             store.mark_seen(segment_id, [item["url"] for item in digest["items"]])
         store.save_digest(digest)
         store.save_segment_students(segment_id, [student_id])
+        if digest["items"]:
+            # Tell Zigex, which sends the student a push and an email ("your recommendations are ready")
+            digest["delivered"] = delivery.push_digest(digest, [student_id])
+            store.save_digest(digest)
         return {"segment": segment_id, "status": digest["status"], "items": len(digest["items"])}
     except Exception as error:
         if not isinstance(error, RETRYABLE) or self.request.retries >= self.max_retries:

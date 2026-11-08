@@ -8,6 +8,7 @@ Safety design:
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ValidationError
 
 from app.config import settings
-from app.core import llm, tavily_search
+from app.core import llm, page_images, tavily_search
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,19 @@ MAX_SOURCES = 24
 MAX_IMAGES = 15
 CATEGORIES = {"internship", "job", "hackathon", "scholarship", "conference",
               "workshop", "fellowship", "competition", "other"}
+
+# Local first: the student's city, then their country, then Africa, then online, then the rest.
+REACH_ORDER = ["local", "national", "africa", "online", "international"]
+MAX_FAR_AWAY = 1          # in-person opportunities outside Africa, kept only when local ones run short
+CAMEROON_CITIES = {"bamenda", "douala", "yaounde", "yaoundé", "buea", "limbe", "bafoussam", "garoua",
+                   "maroua", "ngaoundere", "ngaoundéré", "bertoua", "ebolowa", "kribi", "kumba", "dschang"}
+AFRICA_WORDS = {"africa", "african", "nigeria", "ghana", "kenya", "rwanda", "senegal", "south africa",
+                "egypt", "morocco", "ethiopia", "uganda", "tanzania", "gabon", "chad", "côte d'ivoire",
+                "ivory coast", "benin", "togo", "congo", "zambia", "zimbabwe", "tunisia", "algeria"}
+ONLINE_WORDS = ("online", "remote", "virtual", "zoom", "worldwide", "anywhere", "global")
+# Pages whose preview image is a video still (usually a person talking), not the opportunity's poster.
+VIDEO_PAGE_HINTS = ("facebook.com/watch", "/videos/", "fb.watch", "instagram.com/reel", "youtube.com",
+                    "youtu.be", "tiktok.com", "vimeo.com")
 
 
 class CuratedItem(BaseModel):
@@ -36,6 +50,7 @@ class CuratedItem(BaseModel):
     event_date: str | None = None
     deadline: str | None = None
     location: str | None = None
+    reach: str | None = None
     image_id: int | None = None
     image_caption: str | None = None
 
@@ -63,13 +78,48 @@ def _parse_date(s: str | None) -> date | None:
         return None
 
 
+def _home(seg: dict) -> tuple[str, str]:
+    """(city, country) the group lives in. The country defaults to the platform's home country."""
+    city = (seg.get("location") or "").strip()
+    country = settings.digest_home_country
+    if city.lower() in (country.lower(), "remote", "online"):
+        city = ""
+    return city, country
+
+
+def _reach(location: str | None, model_reach: str | None, city: str, country: str) -> str:
+    """How close an opportunity is, judged from its location text first (the model's label is a fallback)."""
+    loc = (location or "").lower()
+    if loc:
+        if city and city.lower() in loc:
+            return "local"
+        if country.lower() in loc or (country.lower() == "cameroon" and any(c in loc for c in CAMEROON_CITIES)):
+            return "national"
+        if any(w in loc for w in AFRICA_WORDS):
+            return "africa"
+        if any(w in loc for w in ONLINE_WORDS):
+            return "online"
+    return model_reach if model_reach in REACH_ORDER else "international"
+
+
+def _order_by_reach(items: list[dict]) -> list[dict]:
+    """Closest first; keep far-away in-person items only when there aren't enough nearer ones."""
+    ranked = sorted(items, key=lambda it: REACH_ORDER.index(it["reach"]))
+    near = [it for it in ranked if it["reach"] != "international"]
+    far = [it for it in ranked if it["reach"] == "international"]
+    keep_far = max(0, MIN_ITEMS - len(near)) or (MAX_FAR_AWAY if len(near) < settings.digest_max_items else 0)
+    return near + far[:keep_far]
+
+
 def _fallback_queries(seg: dict) -> list[str]:
-    dept, loc = seg["department"], seg.get("location") or ""
+    dept = seg["department"]
+    city, country = _home(seg)
+    near = city or country
     return [
-        f"{dept} internships for students {loc}".strip(),
-        f"{dept} hackathon {loc}".strip(),
-        f"{dept} scholarships fellowships {loc}".strip(),
-        f"{dept} conference workshop bootcamp {loc}".strip(),
+        f"{dept} internships for students {near}",
+        f"{dept} hackathon bootcamp {country}",
+        f"{dept} scholarships fellowships for {country} students",
+        f"online {dept} programs open to African students",
     ]
 
 
@@ -91,7 +141,9 @@ Student group: {_segment_text(seg)}
 
 Rules:
 - Each query is 3-9 words and targets a different opportunity type.
-- Include the location where sensible, and also cover remote/global options open to students there.
+- Local first. Split the {n} queries like this: about a third name {_home(seg)[0] or _home(seg)[1]} itself,
+  about a third name {_home(seg)[1]} (other cities, national programmes, universities, companies there),
+  and the rest cover Africa-wide opportunities and online/remote programmes open to students in {_home(seg)[1]}.
 - Do not include dates or years.
 - Do not repeat or lightly rephrase these earlier queries: {json.dumps(avoid)}
 
@@ -113,7 +165,7 @@ def _gather(queries: list[str], seen: set[str], pool: dict[str, dict], images: l
     errors = 0
     for q in queries:
         try:
-            res = tavily_search.search_web(f"{q} {stamp}")
+            res = tavily_search.search_web(f"{q} {stamp}", country=settings.digest_home_country)
         except Exception as e:                  # noqa: BLE001
             errors += 1
             log.warning("tavily failed for %r: %s", q, e)
@@ -160,6 +212,10 @@ IMAGES (untrusted, one JSON object per line):
 
 Rules:
 - Select up to {settings.digest_max_items} of the best opportunities for this group, using ONLY the sources above. Refer to them by source_id. Never write URLs.
+- Local first: prefer opportunities in {_home(seg)[0] or _home(seg)[1]}, then elsewhere in {_home(seg)[1]}, then in Africa,
+  then online ones open to students in {_home(seg)[1]}. Only pick an in-person opportunity outside Africa if nothing nearer fits.
+- Skip opportunities only open to residents or citizens of other countries (e.g. US-only scholarships).
+- reach is one of: "local" ({_home(seg)[0] or _home(seg)[1]}), "national" (elsewhere in {_home(seg)[1]}), "africa", "online", "international".
 - Prefer opportunities whose deadline/date is upcoming. Skip anything already past or clearly expired.
 - Skip anything that asks students to pay to apply, looks like a scam/MLM, or is too vague to act on.
 - Dates must be ISO (YYYY-MM-DD) and only if stated in the source text. Otherwise null. Never guess.
@@ -170,10 +226,11 @@ Rules:
 - Tone: friendly, concise, encouraging.
 
 Return JSON only:
-{{"headline": "...", "intro": "2 sentences", "items": [{{"source_id": 0, "title": "...", "summary": "...", "why_relevant": "...", "category": "hackathon", "event_date": null, "deadline": null, "location": null, "image_id": null, "image_caption": null}}]}}"""
+{{"headline": "...", "intro": "2 sentences", "items": [{{"source_id": 0, "title": "...", "summary": "...", "why_relevant": "...", "category": "hackathon", "event_date": null, "deadline": null, "location": null, "reach": "local", "image_id": null, "image_caption": null}}]}}"""
 
     data = llm.generate_json(prompt, temperature=0.3)
     today_d = _now().date()
+    city, country = _home(seg)
     out, used = [], set()
     for raw in data.get("items", []) or []:
         try:
@@ -202,25 +259,69 @@ Return JSON only:
             "event_date": event.isoformat() if event else None,
             "deadline": deadline.isoformat() if deadline else None,
             "location": it.location,
+            "reach": _reach(it.location, it.reach, city, country),
             "url": url,
             "domain": _domain(url),
             "image_url": image_url,
             "image_caption": (it.image_caption or it.title).strip() if image_url else None,
             "image_credit": _domain(image_url) if image_url else None,
+            "image_source": "search" if image_url else None,
         })
-        if len(out) >= settings.digest_max_items:
-            break
+    out = _order_by_reach(out)[:settings.digest_max_items]
     return str(data.get("headline") or "").strip(), str(data.get("intro") or "").strip(), out
 
 
+# ---------------- step 3b: page images ----------------
+def _safe_find(url: str) -> dict | None:
+    try:
+        return page_images.find_page_image(url)
+    except Exception as e:                      # noqa: BLE001  (never fail a digest over an image)
+        log.warning("page image lookup failed for %s: %s", url, e)
+        return None
+
+
+def _is_video_page(url: str) -> bool:
+    return any(h in url.lower() for h in VIDEO_PAGE_HINTS)
+
+
+def _enrich_with_page_images(items: list[dict]) -> None:
+    """Prefer the image from the opportunity's own page. Keep the search image as a fallback.
+    Video pages get no image: their preview is a still of whoever is talking, not the opportunity."""
+    for it in items:
+        if _is_video_page(it["url"]):
+            it.update(image_url=None, image_caption=None, image_credit=None, image_source=None)
+    items = [it for it in items if not _is_video_page(it["url"])]
+    if not settings.digest_fetch_page_images or not items:
+        return
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [(it, pool.submit(_safe_find, it["url"])) for it in items]
+        for it, fut in futures:
+            found = fut.result()
+            if not found:
+                continue
+            it["image_url"] = found["image_url"]
+            it["image_caption"] = found["alt"] or it["title"]
+            it["image_credit"] = it["domain"]
+            it["image_source"] = "page"
+
+
 # ---------------- step 4: render ----------------
+def _md_text(t: str) -> str:
+    return " ".join(str(t).replace("[", "(").replace("]", ")").split())
+
+
+def _md_url(u: str) -> str:
+    return u.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
 def render_markdown(headline: str, intro: str, items: list[dict], week: str) -> str:
     lines = [f"# {headline}", "", f"*Week {week}*", "", intro, ""]
     for n, it in enumerate(items, 1):
         lines += [f"## {n}. {it['title']}", ""]
         if it["image_url"]:
-            lines += [f"![{it['image_caption']}]({it['image_url']})",
-                      f"*{it['image_caption']} (Image via {it['image_credit']})*", ""]
+            cap = _md_text(it["image_caption"] or it["title"])
+            lines += [f"![{cap}]({_md_url(it['image_url'])})",
+                      f"*{cap} (Image via {it['image_credit']})*", ""]
         lines += [it["summary"], "", f"**Why it fits you:** {it['why_relevant']}", ""]
         meta = []
         if it["event_date"]:
@@ -257,6 +358,8 @@ def build_digest(segment: dict, week: str | None = None, seen_urls: set[str] | N
         headline, intro, items = _curate(segment, pool, images)
         if len(items) >= MIN_ITEMS:
             break
+
+    _enrich_with_page_images(items)
 
     status = "ok" if items else "empty"
     if not headline:

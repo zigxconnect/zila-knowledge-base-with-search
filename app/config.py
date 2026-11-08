@@ -28,11 +28,15 @@ class Settings(BaseSettings):
     zigex_webhook_secret: str = ""             # HMAC-SHA256 signing secret
 
     digest_timezone: str = "Africa/Douala"
+    digest_home_country: str = "Cameroon"     # local first: student's city, then this country, then Africa/online
     digest_cron_day: str = "mon"               # mon..sun
     digest_cron_hour: int = 6
-    digest_queries_per_segment: int = 4
+    digest_queries_per_segment: int = 6          # local first: 2 city, 2 country, 1 Africa, 1 online
     digest_max_items: int = 6
     digest_auto_publish: bool = True           # False = staff must approve before delivery
+    digest_fetch_page_images: bool = True      # read each opportunity's own page image (Open Graph)
+    digest_fetch_user_agent: str = "ZigexDigestBot/1.0 (link preview)"
+    mock_mode: bool = False                    # fake page images for testing
 
 
 settings = Settings()

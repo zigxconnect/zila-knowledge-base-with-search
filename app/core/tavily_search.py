@@ -15,8 +15,9 @@ def _client() -> TavilyClient:
     return TavilyClient(api_key=settings.tavily_api_key)
 
 
-def search_web(query: str, max_results: int = 6) -> dict:
-    """Returns {'results': [{url,title,content,score,...}], 'images': [{url,description}]}."""
+def search_web(query: str, max_results: int = 6, country: str | None = None) -> dict:
+    """Returns {'results': [{url,title,content,score,...}], 'images': [{url,description}]}.
+    `country` boosts (does not restrict) results from that country."""
     last: Exception | None = None
     for attempt in range(3):
         try:
@@ -28,6 +29,7 @@ def search_web(query: str, max_results: int = 6) -> dict:
                 time_range="month",
                 include_images=True,
                 include_image_descriptions=True,
+                **({"country": country.lower()} if country else {}),
             )
             images = []
             for im in res.get("images", []) or []:
